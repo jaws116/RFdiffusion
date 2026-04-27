@@ -24,6 +24,25 @@ inference:
   cyclic: False 
   cyc_chains: 'a'
 
+  # Optional preprocessing: build a temporary input PDB containing *two* copies
+  # of a selected motif/region from `input_pdb`, translated a fixed distance
+  # apart and centered on the midpoint between their centers of mass.
+  #
+  # This is useful for seeding diffusion with two copies of the same motif.
+  input_pdb_motif_copies:
+    enabled: False
+    # Residues to extract from the input PDB, e.g. "A25-109" or "A10-25/A30-31".
+    residue_spec: null
+    # Distance (Å) between motif copy centers of mass.
+    distance: null
+    # Translation axis for the copy: x|y|z.
+    axis: x
+    # Optional: chain ID for the copied motif (single-chain residue specs only).
+    copy_chain_id: null
+    # Optional: where to write the prepared PDB. If null, a path derived from
+    # `inference.output_prefix` will be used.
+    output_path: null
+
 contigmap:
   contigs: null
   inpaint_seq: null

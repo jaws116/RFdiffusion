@@ -169,6 +169,40 @@ class Sampler:
             self.inf_conf.input_pdb = os.path.join(
                 script_dir, "../../examples/input_pdbs/1qys.pdb"
             )
+
+        # Optional: preprocess the input PDB by extracting a motif region, duplicating it,
+        # translating the copy a fixed distance, and centering on the midpoint.
+        # This produces a new PDB file that is then consumed by process_target() like normal.
+        if (
+            "input_pdb_motif_copies" in self.inf_conf
+            and self.inf_conf.input_pdb_motif_copies is not None
+            and bool(self.inf_conf.input_pdb_motif_copies.enabled)
+        ):
+            cfg = self.inf_conf.input_pdb_motif_copies
+            residue_spec = cfg.residue_spec
+            distance = cfg.distance
+            axis = cfg.axis
+            copy_chain_id = cfg.copy_chain_id
+            output_path = cfg.output_path
+            if output_path is None:
+                # Keep the generated PDB near the outputs for reproducibility.
+                output_path = f"{self.inf_conf.output_prefix}_motif_copies.pdb"
+            self._log.info(
+                f"Preparing input PDB with motif copies: residue_spec={residue_spec}, distance={distance}, axis={axis}"
+            )
+            prepared_pdb, chain_map = iu.build_input_pdb_with_motif_copies(
+                input_pdb_path=self.inf_conf.input_pdb,
+                residue_spec=residue_spec,
+                distance=distance,
+                axis=axis,
+                copy_chain_id=copy_chain_id,
+                output_path=output_path,
+            )
+            self._log.info(
+                f"Using prepared input PDB: {prepared_pdb} (copy chain map: {chain_map})"
+            )
+            self.inf_conf.input_pdb = prepared_pdb
+
         self.target_feats = iu.process_target(
             self.inf_conf.input_pdb, parse_hetatom=True, center=False
         )
@@ -385,12 +419,9 @@ class Sampler:
                         )
                     chain_id = available_chains[0]
                     available_chains.remove(chain_id)
-                # Otherwise, use the chain of the fixed (motif) residues
+                # Otherwise, use the chain of the first fixed (motif) residue block
                 else:
-                    assert (
-                        len(chain_ids) == 1
-                    ), f"Error: Multiple chain IDs in chain: {chain_ids}"
-                    chain_id = list(chain_ids)[0]
+                    chain_id = sorted(list(chain_ids))[0]
                 self.chain_idx += [chain_id] * (last_res - first_res)
             # If this is a fixed chain, maintain the chain and residue numbering
             else:
@@ -398,10 +429,10 @@ class Sampler:
                     contig_ref[1]
                     for contig_ref in self.contig_map.ref[first_res:last_res]
                 ]
-                assert (
-                    len(chain_ids) == 1
-                ), f"Error: Multiple chain IDs in chain: {chain_ids}"
-                self.chain_idx += [list(chain_ids)[0]] * (last_res - first_res)
+                self.chain_idx += [
+                    contig_ref[0]
+                    for contig_ref in self.contig_map.ref[first_res:last_res]
+                ]
             first_res = last_res
 
         ####################################
@@ -422,6 +453,7 @@ class Sampler:
             # Partially diffusing from a known structure
             xyz_mapped = xyz_27
             atom_mask_mapped = mask_27
+            xyz_ref_for_potentials = xyz_mapped
         else:
             # Fully diffusing from points initialised at the origin
             # adjust size of input xt according to residue map
@@ -430,12 +462,20 @@ class Sampler:
                 contig_map.ref_idx0, ...
             ]
             xyz_motif_prealign = xyz_mapped.clone()
+            xyz_ref_for_potentials = xyz_motif_prealign[0, 0]
             motif_prealign_com = xyz_motif_prealign[0, 0, :, 1].mean(dim=0)
             self.motif_com = xyz_27[contig_map.ref_idx0, 1].mean(dim=0)
             xyz_mapped = get_init_xyz(xyz_mapped).squeeze()
             # adjust the size of the input atom map
             atom_mask_mapped = torch.full((L_mapped, 27), False)
             atom_mask_mapped[contig_map.hal_idx0] = mask_27[contig_map.ref_idx0]
+
+        # Attach common runtime context to all potentials (contig-aware potentials need this)
+        if self.potential_manager is not None and not self.potential_manager.is_empty():
+            for pot in self.potential_manager.potentials_to_apply:
+                pot.diffusion_mask = self.diffusion_mask.squeeze()
+                pot.contig_map = self.contig_map
+                pot.xyz_ref = xyz_ref_for_potentials
 
         # Diffuse the contig-mapped coordinates
         if self.diffuser_conf.partial_T:
@@ -1119,6 +1159,13 @@ class ScaffoldedSampler(SelfConditioning):
         )
 
         self.chain_idx = ["A" if i < self.binderlen else "B" for i in range(self.L)]
+
+        # Attach common runtime context to all potentials (contig-aware potentials need this)
+        if self.potential_manager is not None and not self.potential_manager.is_empty():
+            for pot in self.potential_manager.potentials_to_apply:
+                pot.diffusion_mask = self.diffusion_mask.squeeze()
+                pot.contig_map = self.contig_map
+                pot.xyz_ref = xT
 
         ########################
         ### Handle Partial T ###

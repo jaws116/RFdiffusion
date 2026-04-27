@@ -503,8 +503,15 @@ class IGSO3:
         # Approximate the score based on the prediction of R0.
         # R_t @ hat(Score_approx) is the score approximation in the Lie algebra
         # SO(3) (i.e. the output of Algorithm 1)
-        Omega = torch.linalg.norm(R_0t_rotvec, axis=-1).numpy()
-        Score_approx = R_0t_rotvec * (self.score_norm(t, Omega) / Omega)[:, None]
+        # NOTE: Omega can be exactly 0 (identity rotation). In that case
+        # `score_norm(t, Omega) / Omega` produces inf and `0 * inf -> NaN`.
+        # Use a safe divide so the omega==0 score contribution is exactly zero.
+        Omega = torch.linalg.norm(R_0t_rotvec, axis=-1).cpu().numpy()
+        score_norm = self.score_norm(t, Omega)
+        ratio = np.zeros_like(score_norm)
+        np.divide(score_norm, Omega, out=ratio, where=(Omega > 0))
+        ratio_t = torch.from_numpy(ratio).to(device=R_0t_rotvec.device, dtype=R_0t_rotvec.dtype)
+        Score_approx = R_0t_rotvec * ratio_t[:, None]
 
         # Compute scaling for score and sampled noise (following Eq 6 of [2])
         continuous_t = t / self.T

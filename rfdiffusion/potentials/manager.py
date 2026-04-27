@@ -1,3 +1,5 @@
+import sys
+
 import torch
 from rfdiffusion.potentials import potentials as potentials
 import numpy as np 
@@ -113,6 +115,7 @@ class PotentialManager:
                 if setting['type'] in potentials.require_binderlen:
                     setting.update(binderlen_update)
 
+        self.setting_list = setting_list
         self.potentials_to_apply = self.initialize_all_potentials(setting_list)
         self.T = diffuser_config.T
         
@@ -133,8 +136,15 @@ class PotentialManager:
 
         setting_dict = {entry.split(':')[0]:entry.split(':')[1] for entry in potstr.split(',')}
 
-        for key in setting_dict:
-            if not key == 'type': setting_dict[key] = float(setting_dict[key])
+        for key in list(setting_dict.keys()):
+            if key == 'type':
+                continue
+            val = setting_dict[key]
+            try:
+                setting_dict[key] = float(val)
+            except ValueError:
+                # Allow non-numeric settings (e.g. contig/PDB residue specs like 'A10-25/A30-31')
+                setting_dict[key] = val
 
         return setting_dict
 
@@ -149,7 +159,7 @@ class PotentialManager:
         for potential_dict in setting_list:
             assert(potential_dict['type'] in potentials.implemented_potentials), f'potential with name: {potential_dict["type"]} is not one of the implemented potentials: {potentials.implemented_potentials.keys()}'
 
-            kwargs = {k: potential_dict[k] for k in potential_dict.keys() - {'type'}}
+            kwargs = {k: potential_dict[k] for k in potential_dict.keys() - {'type', 'guide_decay'}}
 
             # symmetric oligomer contact potential args
             if self.inference_config.symmetry:
@@ -167,15 +177,45 @@ class PotentialManager:
 
         return to_apply
 
-    def compute_all_potentials(self, xyz):
+    def compute_all_potentials(self, xyz, t=None):
         '''
             This is the money call. Take the current sequence and structure information and get the sum of all of the potentials that are being used
         '''
 
-        potential_list = [potential.compute(xyz) for potential in self.potentials_to_apply]
+        potential_list = []
+        for potential, setting in zip(self.potentials_to_apply, self.setting_list):
+            val = potential.compute(xyz)
+            
+            # Apply potential-specific decay multiplier if configured
+            if t is not None and 'guide_decay' in setting:
+                decay_scale = self._get_decay_scale(t, setting['guide_decay'])
+                val = val * decay_scale
+                
+            potential_list.append(val)
+            
         potential_stack = torch.stack(potential_list, dim=0)
 
         return torch.sum(potential_stack, dim=0)
+
+    def _get_decay_scale(self, t, decay_type):
+        '''
+        Compute a scale factor from 0.0 to 1.0 (undamped) based on decay_type
+        '''
+        implemented_decay_types = {
+                'constant': lambda t: 1.0,
+                'linear'  : lambda t: t/self.T,
+                'quadratic' : lambda t: (t/self.T)**2,
+                'cubic' : lambda t: (t/self.T)**3,
+                'inverse_linear': lambda t: 1.0 - (t/self.T),
+                'inverse_quadratic': lambda t: 1.0 - (t/self.T)**2,
+                'inverse_cubic': lambda t: 1.0 - (t/self.T)**3,
+                'inverse_sqrt': lambda t: 1.0 - (t/self.T)**0.5
+        }
+        
+        if decay_type not in implemented_decay_types:
+            sys.exit(f'decay_type must be one of {implemented_decay_types.keys()}. Received decay_type={decay_type}. Exiting.')
+        
+        return implemented_decay_types[decay_type](t)
 
     def get_guide_scale(self, t):
         '''
@@ -191,18 +231,8 @@ class PotentialManager:
         
         '''
         
-        implemented_decay_types = {
-                'constant': lambda t: self.guide_scale,
-                # Linear interpolation with y2: 0, y1: guide_scale, x2: 0, x1: T, x: t
-                'linear'  : lambda t: t/self.T * self.guide_scale,
-                'quadratic' : lambda t: t**2/self.T**2 * self.guide_scale,
-                'cubic' : lambda t: t**3/self.T**3 * self.guide_scale
-        }
-        
-        if self.guide_decay not in implemented_decay_types:
-            sys.exit(f'decay_type must be one of {implemented_decay_types.keys()}. Received decay_type={self.guide_decay}. Exiting.')
-        
-        return implemented_decay_types[self.guide_decay](t)
+        scale = self._get_decay_scale(t, self.guide_decay)
+        return scale * self.guide_scale
 
 
         

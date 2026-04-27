@@ -454,6 +454,351 @@ class substrate_contacts(Potential):
             self.motif_frame = xyz[rand_idx[0],:4]
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
 
+
+class motif_rigid(Potential):
+    '''
+    Penalize changes in a motif's internal geometry while allowing free rigid-body motion.
+
+    Motifs are specified using input-PDB residue IDs (e.g. 'A10-25/A30-31'). This class
+    is "contig-aware" in the sense that it resolves those residue IDs through the active
+    `ContigMap` (attached at runtime as `self.contig_map`).
+
+    Required runtime attributes (set by the model runner):
+      - contig_map: ContigMap
+      - xyz_ref: torch.Tensor [L,27,3] reference coordinates (pre-noise template frame)
+
+    Notes:
+      - This potential is maximized, so we return the negative of the distance-matrix MSE.
+      - Uses a single atom per residue (default: CA) for the internal distance matrix.
+    '''
+
+    _ATOM_NAME_TO_IDX = {
+        'N': 0,
+        'CA': 1,
+        'C': 2,
+        'O': 3,
+        'CB': 4,
+    }
+
+    def __init__(
+        self,
+        weight=1.0,
+        k=1.0,
+        motif=None,
+        motif1=None,
+        motif2=None,
+        atom='CA',
+        eps=1e-6,
+    ):
+        self.weight = float(weight)
+        self.k = float(k)
+        self.motif_spec = motif
+        self.motif1_spec = motif1
+        self.motif2_spec = motif2
+        self.atom = str(atom).upper()
+        self.eps = float(eps)
+
+        self._motif_idx_cache = None  # dict[str, torch.LongTensor]
+        self._ref_dmat_cache = None   # dict[str, torch.Tensor]
+        self._cache_device = None
+        self._cache_dtype = None
+
+    def _parse_residue_spec(self, spec):
+        if spec is None:
+            return []
+        spec = str(spec).strip()
+        if not spec:
+            return []
+
+        res = []
+        parts = [p for p in spec.split('/') if p]
+        for part in parts:
+            part = part.strip()
+            if len(part) < 2 or not part[0].isalpha():
+                raise ValueError(f"Invalid residue spec '{part}'. Expected like A10-25")
+            chain = part[0]
+            rng = part[1:]
+            if '-' in rng:
+                start_s, end_s = rng.split('-', 1)
+                start = int(start_s)
+                end = int(end_s)
+                if end < start:
+                    raise ValueError(f"Invalid residue range '{part}'")
+                res.extend([(chain, i) for i in range(start, end + 1)])
+            else:
+                res.append((chain, int(rng)))
+        return res
+
+    def _resolve_indices(self, residue_ids):
+        # contig_map.ref is a list like [('A',10), ..., ('_', '_'), ...]
+        ref = getattr(self.contig_map, 'ref', None)
+        if ref is None:
+            raise ValueError('motif_rigid requires `contig_map.ref` at runtime')
+
+        residue_set = set(residue_ids)
+        idx = [i for i, r in enumerate(ref) if r in residue_set]
+        if not idx:
+            raise ValueError(
+                f"motif_rigid: none of the requested residues were found in contig_map.ref. "
+                f"Requested: {sorted(residue_set)[:5]}{'...' if len(residue_set) > 5 else ''}"
+            )
+        # ensure stable order and uniqueness
+        idx = sorted(set(idx))
+        return torch.tensor(idx, dtype=torch.long)
+
+    def _get_groups(self):
+        groups = {}
+        if self.motif_spec is not None:
+            groups['motif'] = self.motif_spec
+        if self.motif1_spec is not None:
+            groups['motif1'] = self.motif1_spec
+        if self.motif2_spec is not None:
+            groups['motif2'] = self.motif2_spec
+        if not groups:
+            raise ValueError('motif_rigid requires `motif`, `motif1`, and/or `motif2` to be set')
+        return groups
+
+    def _ensure_cache(self, xyz):
+        if not hasattr(self, 'contig_map') or self.contig_map is None:
+            raise ValueError('motif_rigid requires `contig_map` to be attached at runtime')
+        if not hasattr(self, 'xyz_ref') or self.xyz_ref is None:
+            raise ValueError('motif_rigid requires `xyz_ref` to be attached at runtime')
+
+        device = xyz.device
+        dtype = xyz.dtype
+
+        if (
+            self._motif_idx_cache is not None
+            and self._ref_dmat_cache is not None
+            and self._cache_device == device
+            and self._cache_dtype == dtype
+        ):
+            return
+
+        atom_names = [a.strip().upper() for a in self.atom.replace('_', ',').split(',') if a.strip()]
+        atom_idx = []
+        for a in atom_names:
+            idx_val = self._ATOM_NAME_TO_IDX.get(a, None)
+            if idx_val is None:
+                raise ValueError(f"motif_rigid: unsupported atom '{a}'. Use one of {sorted(self._ATOM_NAME_TO_IDX)}")
+            atom_idx.append(idx_val)
+        self._motif_atom_idx = atom_idx
+
+        xyz_ref = self.xyz_ref
+        if not torch.is_tensor(xyz_ref):
+            xyz_ref = torch.as_tensor(xyz_ref)
+        xyz_ref = xyz_ref.to(device=device, dtype=dtype)
+
+        idx_cache = {}
+        dmat_cache = {}
+        for name, spec in self._get_groups().items():
+            residue_ids = self._parse_residue_spec(spec)
+            idx = self._resolve_indices(residue_ids).to(device=device)
+            if idx.numel() < 2 and len(atom_idx) < 2:
+                raise ValueError(f"motif_rigid: group '{name}' must include at least 2 residues or 2 atoms")
+
+            ref_coords = xyz_ref[idx][:, atom_idx, :].reshape(-1, 3).contiguous()
+            if torch.isnan(ref_coords).any():
+                raise ValueError(f"motif_rigid: reference coords contain NaNs for group '{name}'")
+
+            dref = torch.cdist(ref_coords[None, ...], ref_coords[None, ...], p=2)[0]
+            idx_cache[name] = idx
+            dmat_cache[name] = dref
+
+        self._motif_idx_cache = idx_cache
+        self._ref_dmat_cache = dmat_cache
+        self._cache_device = device
+        self._cache_dtype = dtype
+
+    def compute(self, xyz):
+        self._ensure_cache(xyz)
+
+        atom_idx = self._motif_atom_idx
+        # total_mse = xyz.new_tensor(0.0)
+        pseudo_huber_loss = xyz.new_tensor(0.0)
+
+        for name, idx in self._motif_idx_cache.items():
+            coords = xyz[idx][:, atom_idx, :].reshape(-1, 3).contiguous()
+            dcur = torch.cdist(coords[None, ...], coords[None, ...], p=2)[0]
+            dref = self._ref_dmat_cache[name]
+            # total_mse = total_mse + torch.mean((dcur - dref) ** 2)
+            pseudo_huber_loss = pseudo_huber_loss + torch.mean(torch.sqrt(((dcur - dref)/self.k) ** 2 + 1) - 1)
+
+        return -self.weight * self.k ** 2 * pseudo_huber_loss
+
+
+class motif_distance(Potential):
+    """A potential that encourages two motifs to stay a set distance apart.
+
+    This is intended for *unfrozen* motifs (i.e. positions where `diffusion_mask` is False)
+    and operates on motif centroids (CA by default), so relative rigid-body orientation is
+    unconstrained.
+
+    Motifs can be specified either as:
+      - explicit index mappings: `motif1_mapping`, `motif2_mapping` (0-indexed positions in the
+        full design length), OR
+      - contig/PDB residue specs: `motif1`, `motif2` like 'A10-25/A30-31'. These require
+        `contig_map` to be attached at runtime.
+    """
+
+    _ATOM_NAME_TO_IDX = {
+        # RFdiffusion atom14/27 conventions: CA is index 1
+        'CA': 1,
+    }
+
+    def __init__(
+        self,
+        weight=1,
+        target_distance=10,
+        motif1=None,
+        motif2=None,
+        motif1_mapping=None,
+        motif2_mapping=None,
+        atom='CA',
+        loss='l2',
+    ):
+        self.weight = weight
+        self.target_distance = target_distance
+
+        self.motif1 = motif1
+        self.motif2 = motif2
+        self.motif1_mapping = motif1_mapping
+        self.motif2_mapping = motif2_mapping
+
+        self.atom = atom
+        self.loss = loss
+
+        # caches (populated on first call)
+        self._idx1_cache = None
+        self._idx2_cache = None
+        self._cache_device = None
+
+    def _parse_residue_spec(self, spec):
+        if spec is None:
+            return []
+        spec = str(spec).strip()
+        if not spec:
+            return []
+
+        parts = [p.strip() for p in spec.split('/') if p.strip()]
+        residue_ids = []
+        for part in parts:
+            # Accept the common format used throughout RFdiffusion configs:
+            #   A25-109   (chain letter specified once)
+            #   A10-25/A30-31
+            if len(part) < 2 or not part[0].isalpha():
+                raise ValueError(f"motif_distance: invalid residue spec '{part}'. Expected like A10-25")
+
+            chain = part[0]
+            rng = part[1:]
+            if '-' in rng:
+                start_s, end_s = rng.split('-', 1)
+                start = int(start_s)
+                end = int(end_s)
+                if end < start:
+                    raise ValueError(f"motif_distance: invalid residue range '{part}'")
+                residue_ids.extend([(chain, r) for r in range(start, end + 1)])
+            else:
+                residue_ids.append((chain, int(rng)))
+
+        return residue_ids
+
+    def _resolve_indices(self, residue_ids):
+        if not hasattr(self, 'contig_map') or self.contig_map is None:
+            raise ValueError('motif_distance: contig residue specs require `contig_map` to be attached at runtime')
+
+        ref = self.contig_map.ref
+        ref_to_idx = {res: i for i, res in enumerate(ref) if res != ("_", "_")}
+
+        idx = []
+        for res in residue_ids:
+            if res not in ref_to_idx:
+                raise ValueError(f"motif_distance: residue {res} not found in contig_map.ref")
+            idx.append(ref_to_idx[res])
+
+        return torch.as_tensor(idx, dtype=torch.long)
+
+    def _ensure_idx_cache(self, xyz):
+        device = xyz.device
+        if self._idx1_cache is not None and self._idx2_cache is not None and self._cache_device == device:
+            return
+
+        # Resolve motif1 indices
+        if self.motif1_mapping is not None:
+            idx1 = torch.as_tensor(self.motif1_mapping, dtype=torch.long)
+        elif self.motif1 is not None:
+            idx1 = self._resolve_indices(self._parse_residue_spec(self.motif1))
+        else:
+            raise ValueError('motif_distance: provide either motif1_mapping or motif1')
+
+        # Resolve motif2 indices
+        if self.motif2_mapping is not None:
+            idx2 = torch.as_tensor(self.motif2_mapping, dtype=torch.long)
+        elif self.motif2 is not None:
+            idx2 = self._resolve_indices(self._parse_residue_spec(self.motif2))
+        else:
+            raise ValueError('motif_distance: provide either motif2_mapping or motif2')
+
+        if idx1.numel() == 0 or idx2.numel() == 0:
+            raise ValueError('motif_distance: motifs must each include at least one residue')
+
+        self._idx1_cache = idx1.to(device=device)
+        self._idx2_cache = idx2.to(device=device)
+        self._cache_device = device
+
+    def _coords_for_idx(self, xyz, idx, atom_idx):
+        coords = xyz[idx, atom_idx, :]
+
+        # Prefer unfrozen residues if a diffusion mask is attached (diffusion_mask==True => frozen)
+        if hasattr(self, 'diffusion_mask') and self.diffusion_mask is not None:
+            dm = torch.as_tensor(self.diffusion_mask, device=coords.device, dtype=torch.bool)
+            try:
+                unfrozen = idx[~dm[idx]]
+                if unfrozen.numel() > 0:
+                    coords = xyz[unfrozen, atom_idx, :]
+            except Exception:
+                # If mask/indexing shapes don't align, just fall back to using all idx
+                pass
+
+        # Drop any NaN coordinates (can occur for missing atoms)
+        keep = ~torch.isnan(coords).any(dim=-1)
+        coords = coords[keep]
+
+        if coords.numel() == 0:
+            return None
+
+        return coords
+
+    def compute(self, xyz):
+        self._ensure_idx_cache(xyz)
+
+        atom_idx = self._ATOM_NAME_TO_IDX.get(self.atom, None)
+        if atom_idx is None:
+            raise ValueError(f"motif_distance: unsupported atom '{self.atom}'. Only 'CA' is supported")
+
+        coords1 = self._coords_for_idx(xyz, self._idx1_cache, atom_idx)
+        coords2 = self._coords_for_idx(xyz, self._idx2_cache, atom_idx)
+
+        # If coordinates are undefined at this timestep (all-NaN), don't crash the run.
+        # Returning zero means "no guidance" for this potential on this step.
+        if coords1 is None or coords2 is None:
+            return xyz.new_tensor(0.0)
+
+        c1 = torch.mean(coords1, dim=0)
+        c2 = torch.mean(coords2, dim=0)
+        distance = torch.sqrt(torch.sum((c1 - c2) ** 2))
+
+        delta = distance - xyz.new_tensor(self.target_distance)
+        if self.loss == 'l1':
+            err = torch.abs(delta)
+        elif self.loss == 'l2':
+            err = delta ** 2
+        else:
+            raise ValueError("motif_distance: loss must be 'l1' or 'l2'")
+
+        return -self.weight * err
+
+
 # Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
 # If you implement a new potential you must add it to this dictionary for it to be used by
 # the PotentialManager
@@ -464,7 +809,9 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'interface_ncontacts':  interface_ncontacts,
                            'monomer_contacts':     monomer_contacts,
                            'olig_contacts':        olig_contacts,
-                           'substrate_contacts':    substrate_contacts}
+                           'substrate_contacts':    substrate_contacts,
+                           'motif_rigid':          motif_rigid,
+                           'motif_distance':       motif_distance}
 
 require_binderlen      = { 'binder_ROG',
                            'binder_distance_ReLU',

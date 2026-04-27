@@ -1,5 +1,7 @@
 import numpy as np
 import os
+import string
+import tempfile
 from omegaconf import DictConfig
 import torch
 import torch.nn.functional as nn
@@ -12,6 +14,7 @@ import random
 import logging
 from rfdiffusion.inference import model_runners
 import glob
+from typing import Dict, List, Optional, Tuple
 
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
@@ -360,7 +363,7 @@ class Denoise:
         px0_[~atom_mask] = float("nan")
         return torch.Tensor(px0_)
 
-    def get_potential_gradients(self, xyz, diffusion_mask):
+    def get_potential_gradients(self, xyz, diffusion_mask, t=None):
         """
         This could be moved into potential manager if desired - NRB
 
@@ -369,6 +372,7 @@ class Denoise:
         Inputs:
 
             xyz (torch.tensor, required): [L,27,3] Coordinates at which the gradient will be computed
+            t: Current diffusion timestep
 
         Outputs:
 
@@ -386,7 +390,7 @@ class Denoise:
         if not xyz.grad is None:
             xyz.grad.zero_()
 
-        current_potential = self.potential_manager.compute_all_potentials(xyz)
+        current_potential = self.potential_manager.compute_all_potentials(xyz, t)
         current_potential.backward()
 
         # Since we are not moving frames, Cb grads are same as Ca grads
@@ -482,7 +486,7 @@ class Denoise:
         # This can be moved to below where the full atom representation is calculated to allow for potentials involving sidechains
 
         grad_ca = self.get_potential_gradients(
-            xt.clone(), diffusion_mask=diffusion_mask
+            xt.clone(), diffusion_mask=diffusion_mask, t=t
         )
 
         ca_deltas += self.potential_manager.get_guide_scale(t) * grad_ca
@@ -514,6 +518,248 @@ def sampler_selector(conf: DictConfig):
         else:
             raise ValueError(f"Unrecognized sampler {conf.model_runner}")
     return sampler
+
+
+def _parse_residue_spec(residue_spec: str) -> List[Tuple[str, int]]:
+    """Parse a motif/contig-style residue spec into (chain, resno) tuples.
+
+    Accepted formats match common RFdiffusion config usage, e.g.:
+      - "A25-109"
+      - "A10-25/A30-31"
+      - "A10" (single residue)
+
+    Returns a *flat* list of residue identifiers.
+    """
+
+    if residue_spec is None:
+        return []
+    spec = str(residue_spec).strip().strip("[]")
+    if not spec:
+        return []
+
+    parts = [p.strip() for p in spec.split("/") if p.strip()]
+    residue_ids: List[Tuple[str, int]] = []
+    for part in parts:
+        if len(part) < 2 or not part[0].isalpha():
+            raise ValueError(
+                f"input_pdb_motif_copies.residue_spec: invalid residue spec '{part}'. Expected like A10-25"
+            )
+        chain = part[0]
+        rng = part[1:]
+
+        if "-" in rng:
+            start_s, end_s = rng.split("-", 1)
+            start = int(start_s)
+            end = int(end_s)
+            if end < start:
+                raise ValueError(
+                    f"input_pdb_motif_copies.residue_spec: invalid residue range '{part}'"
+                )
+            residue_ids.extend([(chain, r) for r in range(start, end + 1)])
+        else:
+            residue_ids.append((chain, int(rng)))
+
+    return residue_ids
+
+
+def build_input_pdb_with_motif_copies(
+    *,
+    input_pdb_path: str,
+    residue_spec: str,
+    distance: float,
+    axis: str = "x",
+    copy_chain_id: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> Tuple[str, Dict[str, str]]:
+    """Create a PDB containing two translated copies of a motif region.
+
+    The new PDB contains only the residues described by `residue_spec` from `input_pdb_path`,
+    plus a second copy translated by `distance` Å along `axis`.
+
+    Coordinates are recentered so the midpoint between the two motif Cα centers of mass is at the origin.
+
+    Returns:
+      (output_path, chain_map) where chain_map maps original chain IDs to copy chain IDs.
+    """
+
+    if input_pdb_path is None or str(input_pdb_path).strip() == "":
+        raise ValueError("build_input_pdb_with_motif_copies: input_pdb_path is required")
+    if residue_spec is None or str(residue_spec).strip() == "":
+        raise ValueError(
+            "build_input_pdb_with_motif_copies: residue_spec is required (e.g. 'A25-109')"
+        )
+    if distance is None:
+        raise ValueError("build_input_pdb_with_motif_copies: distance is required")
+    distance = float(distance)
+    if distance <= 0:
+        raise ValueError("build_input_pdb_with_motif_copies: distance must be > 0")
+
+    axis_l = str(axis).strip().lower()
+    if axis_l not in {"x", "y", "z"}:
+        raise ValueError(
+            f"build_input_pdb_with_motif_copies: axis must be one of x|y|z (got '{axis}')"
+        )
+    axis_unit = {
+        "x": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "y": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        "z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    }[axis_l]
+    half_delta = axis_unit * (distance / 2.0)
+
+    residue_ids = _parse_residue_spec(residue_spec)
+    if len(residue_ids) == 0:
+        raise ValueError(
+            "build_input_pdb_with_motif_copies: residue_spec did not resolve to any residues"
+        )
+
+    residue_set = set(residue_ids)
+    orig_chains = sorted({c for c, _ in residue_set})
+
+    if copy_chain_id is not None:
+        copy_chain_id = str(copy_chain_id)
+        if len(copy_chain_id) != 1:
+            raise ValueError(
+                "build_input_pdb_with_motif_copies: copy_chain_id must be a single character"
+            )
+        if len(orig_chains) != 1:
+            raise ValueError(
+                "build_input_pdb_with_motif_copies: copy_chain_id is only supported for single-chain residue specs"
+            )
+        if copy_chain_id == orig_chains[0]:
+            raise ValueError(
+                "build_input_pdb_with_motif_copies: copy_chain_id must differ from the original chain id"
+            )
+        chain_map: Dict[str, str] = {orig_chains[0]: copy_chain_id}
+    else:
+        pool = list(string.ascii_uppercase + string.ascii_lowercase + string.digits)
+        used = set(orig_chains)
+        available = [c for c in pool if c not in used]
+        if len(available) < len(orig_chains):
+            raise ValueError(
+                "build_input_pdb_with_motif_copies: not enough available chain IDs to create a copy"
+            )
+        chain_map = {ch: available[i] for i, ch in enumerate(orig_chains)}
+
+    with open(input_pdb_path, "r") as f:
+        in_lines = [l.rstrip("\n") for l in f]
+
+    # Filter ATOM lines that belong to the specified residues
+    motif_lines: List[str] = []
+    ca_xyz: List[np.ndarray] = []
+    for l in in_lines:
+        if not l.startswith("ATOM"):
+            continue
+        chain = l[21:22].strip()
+        if not chain:
+            continue
+        try:
+            res_no = int(l[22:26].strip())
+        except ValueError:
+            continue
+        if (chain, res_no) not in residue_set:
+            continue
+        motif_lines.append(l)
+
+        if l[12:16].strip() == "CA":
+            try:
+                x = float(l[30:38])
+                y = float(l[38:46])
+                z = float(l[46:54])
+            except ValueError:
+                continue
+            ca_xyz.append(np.array([x, y, z], dtype=np.float32))
+
+    if len(motif_lines) == 0:
+        raise ValueError(
+            "build_input_pdb_with_motif_copies: no ATOM records matched residue_spec; check chain IDs and residue numbers"
+        )
+    if len(ca_xyz) == 0:
+        raise ValueError(
+            "build_input_pdb_with_motif_copies: could not find any CA atoms for the selected residues"
+        )
+
+    com = np.mean(np.stack(ca_xyz, axis=0), axis=0)
+
+    def _format_atom_line(
+        line: str, *, serial: int, chain_id: str, xyz: np.ndarray
+    ) -> str:
+        # Ensure line is long enough for PDB fixed-column slicing.
+        s = line
+        if len(s) < 80:
+            s = s.ljust(80)
+
+        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        # Keep original atom/residue identity fields; only update serial, chain id and xyz.
+        return (
+            f"{s[:6]}{serial:5d}{s[11:21]}{chain_id}{s[22:30]}"
+            f"{x:8.3f}{y:8.3f}{z:8.3f}{s[54:]}"
+        ).rstrip()  # strip trailing spaces for cleanliness
+
+    out_lines: List[str] = []
+    serial = 1
+
+    # Original motif (centered and shifted to -d/2)
+    for l in motif_lines:
+        chain = l[21:22].strip()
+        if not chain:
+            continue
+        try:
+            x0 = float(l[30:38])
+            y0 = float(l[38:46])
+            z0 = float(l[46:54])
+        except ValueError:
+            continue
+        xyz = np.array([x0, y0, z0], dtype=np.float32)
+        xyz = (xyz - com) - half_delta
+        out_lines.append(
+            _format_atom_line(l, serial=serial, chain_id=chain, xyz=xyz) + "\n"
+        )
+        serial += 1
+
+    out_lines.append("TER\n")
+
+    # Copied motif (centered and shifted to +d/2; chain IDs remapped)
+    for l in motif_lines:
+        chain = l[21:22].strip()
+        if not chain:
+            continue
+        if chain not in chain_map:
+            # Shouldn't happen if residue_spec parsing is consistent with filtered lines.
+            raise ValueError(
+                f"build_input_pdb_with_motif_copies: unexpected chain '{chain}' in filtered motif lines"
+            )
+        chain_copy = chain_map[chain]
+        try:
+            x0 = float(l[30:38])
+            y0 = float(l[38:46])
+            z0 = float(l[46:54])
+        except ValueError:
+            continue
+        xyz = np.array([x0, y0, z0], dtype=np.float32)
+        xyz = xyz - com
+        # Mirror relative to the plane orthogonal to the offset vector
+        # axis_idx = {"x": 0, "y": 1, "z": 2}[axis_l]
+        # xyz[axis_idx] = -xyz[axis_idx]
+        xyz = xyz + half_delta
+        out_lines.append(
+            _format_atom_line(l, serial=serial, chain_id=chain_copy, xyz=xyz) + "\n"
+        )
+        serial += 1
+
+    out_lines.append("END\n")
+
+    if output_path is None:
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False)
+        output_path = tmp.name
+        tmp.close()
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.writelines(out_lines)
+
+    return output_path, chain_map
 
 
 def parse_pdb(filename, **kwargs):
