@@ -10,7 +10,7 @@ class Potential:
     def compute(self, xyz):
         '''
             Given the current structure of the model prediction, return the current
-            potential as a PyTorch tensor with a single entry
+            potential as a‚ PyTorch tensor with a single entry
 
             Args:
                 xyz (torch.tensor, size: [L,27,3]: The current coordinates of the sample
@@ -656,6 +656,8 @@ class motif_distance(Potential):
         motif2_mapping=None,
         atom='CA',
         loss='l2',
+        symmetric_copy=False,
+        symmetry=None,
     ):
         self.weight = weight
         self.target_distance = target_distance
@@ -667,6 +669,8 @@ class motif_distance(Potential):
 
         self.atom = atom
         self.loss = loss
+        self.symmetric_copy = symmetric_copy
+        self.symmetry = symmetry
 
         # caches (populated on first call)
         self._idx1_cache = None
@@ -732,18 +736,24 @@ class motif_distance(Potential):
             raise ValueError('motif_distance: provide either motif1_mapping or motif1')
 
         # Resolve motif2 indices
-        if self.motif2_mapping is not None:
-            idx2 = torch.as_tensor(self.motif2_mapping, dtype=torch.long)
-        elif self.motif2 is not None:
-            idx2 = self._resolve_indices(self._parse_residue_spec(self.motif2))
-        else:
-            raise ValueError('motif_distance: provide either motif2_mapping or motif2')
+        if str(self.symmetric_copy).lower() != 'true':
+            if self.motif2_mapping is not None:
+                idx2 = torch.as_tensor(self.motif2_mapping, dtype=torch.long)
+            elif self.motif2 is not None:
+                idx2 = self._resolve_indices(self._parse_residue_spec(self.motif2))
+            else:
+                raise ValueError('motif_distance: provide either motif2_mapping or motif2')
 
-        if idx1.numel() == 0 or idx2.numel() == 0:
-            raise ValueError('motif_distance: motifs must each include at least one residue')
+            if idx2.numel() == 0:
+                raise ValueError('motif_distance: motif2 must include at least one residue')
+            self._idx2_cache = idx2.to(device=device)
+        else:
+            self._idx2_cache = None
+
+        if idx1.numel() == 0:
+            raise ValueError('motif_distance: motif1 must include at least one residue')
 
         self._idx1_cache = idx1.to(device=device)
-        self._idx2_cache = idx2.to(device=device)
         self._cache_device = device
 
     def _coords_for_idx(self, xyz, idx, atom_idx):
@@ -774,18 +784,31 @@ class motif_distance(Potential):
 
         atom_idx = self._ATOM_NAME_TO_IDX.get(self.atom, None)
         if atom_idx is None:
-            raise ValueError(f"motif_distance: unsupported atom '{self.atom}'. Only 'CA' is supported")
+            raise ValueError(f"motif_distance: unsupported atom '{self.atom}'. Only 'CA', 'CB', 'C', 'N', 'O' supported")
 
         coords1 = self._coords_for_idx(xyz, self._idx1_cache, atom_idx)
-        coords2 = self._coords_for_idx(xyz, self._idx2_cache, atom_idx)
 
-        # If coordinates are undefined at this timestep (all-NaN), don't crash the run.
-        # Returning zero means "no guidance" for this potential on this step.
-        if coords1 is None or coords2 is None:
-            return xyz.new_tensor(0.0)
+        if str(self.symmetric_copy).lower() == 'true':
+            if coords1 is None:
+                return xyz.new_tensor(0.0)
+            c1 = torch.mean(coords1, dim=0)
 
-        c1 = torch.mean(coords1, dim=0)
-        c2 = torch.mean(coords2, dim=0)
+            if self.symmetry is None or not self.symmetry.lower().startswith('c'):
+                raise ValueError("motif_distance: symmetric_copy=True currently only supports C symmetry.")
+            
+            order = int(self.symmetry[1:])
+            from scipy.spatial.transform import Rotation
+            deg = 360.0 / order
+            r = Rotation.from_euler('z', deg, degrees=True).as_matrix()
+            rot_tensor = torch.tensor(r, dtype=c1.dtype, device=c1.device)
+            c2 = torch.einsum('j,kj->k', c1, rot_tensor)
+        else:
+            coords2 = self._coords_for_idx(xyz, self._idx2_cache, atom_idx)
+            if coords1 is None or coords2 is None:
+                return xyz.new_tensor(0.0)
+            c1 = torch.mean(coords1, dim=0)
+            c2 = torch.mean(coords2, dim=0)
+
         distance = torch.sqrt(torch.sum((c1 - c2) ** 2))
 
         delta = distance - xyz.new_tensor(self.target_distance)

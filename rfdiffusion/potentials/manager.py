@@ -162,7 +162,7 @@ class PotentialManager:
             kwargs = {k: potential_dict[k] for k in potential_dict.keys() - {'type', 'guide_decay'}}
 
             # symmetric oligomer contact potential args
-            if self.inference_config.symmetry:
+            if self.inference_config.symmetry and potential_dict['type'] == 'olig_contacts':
 
                 num_chains = calc_nchains(symbol=self.inference_config.symmetry, components=1) # hard code 1 for now 
                 contact_kwargs={'nchain':num_chains,
@@ -172,6 +172,9 @@ class PotentialManager:
                 contact_matrix = make_contact_matrix(**contact_kwargs)
                 kwargs.update({'contact_matrix':contact_matrix})
 
+            # pass symmetry info to motif distance
+            if self.inference_config.symmetry and potential_dict['type'] == 'motif_distance':
+                kwargs.update({'symmetry': self.inference_config.symmetry})
 
             to_apply.append(potentials.implemented_potentials[potential_dict['type']](**kwargs))
 
@@ -206,6 +209,7 @@ class PotentialManager:
                 'linear'  : lambda t: t/self.T,
                 'quadratic' : lambda t: (t/self.T)**2,
                 'cubic' : lambda t: (t/self.T)**3,
+                'sqrt' : lambda t: (t/self.T)**0.5,
                 'inverse_linear': lambda t: 1.0 - (t/self.T),
                 'inverse_quadratic': lambda t: 1.0 - (t/self.T)**2,
                 'inverse_cubic': lambda t: 1.0 - (t/self.T)**3,
