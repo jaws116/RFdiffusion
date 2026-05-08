@@ -159,3 +159,10 @@ scaffoldguided:
   target_adj: null
   mask_loops: True
   contig_crop: null
+
+inference_sampler:
+  floating_motif_project: False
+  floating_motif_project_every: 5
+  floating_motif_burn_in: 20
+  floating_motif_stop_after: 0
+  floating_motifs: null

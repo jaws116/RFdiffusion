@@ -455,6 +455,155 @@ class substrate_contacts(Potential):
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
 
 
+
+class two_level_motif_rigid(Potential):
+    '''
+    Two-Level Rigid Motif Potential:
+    1. Local: Restrains distances within individual automatically detected alpha helices.
+    2. Global: Restrains relative orientations (COM and direction vectors) between the helices.
+    '''
+    _ATOM_NAME_TO_IDX = {'CA': 1, 'N': 0, 'C': 2}
+
+    def __init__(self, weight=1.0, k=1.0, motif=None, eps=1e-6, intra_weight=1.0, inter_weight=1.0, **kwargs):
+        self.weight = float(weight)
+        self.k = float(k)
+        self.motif_spec = motif
+        self.eps = float(eps)
+        self.intra_weight = float(intra_weight)
+        self.inter_weight = float(inter_weight)
+        self._cache_device = None
+        self._helices = None
+        self._ref_coms = None
+        self._ref_vecs = None
+        self._ref_intra_dmats = None
+        self._ref_inter_com_dmat = None
+        self._ref_inter_vec_angles = None
+
+    def _parse_residue_spec(self, spec):
+        if not spec: return []
+        res = []
+        for part in [p.strip() for p in str(spec).split('/') if p.strip()]:
+            chain = part[0]
+            rng = part[1:]
+            if '-' in rng:
+                s, e = rng.split('-', 1)
+                res.extend([(chain, i) for i in range(int(s), int(e) + 1)])
+            else:
+                res.append((chain, int(rng)))
+        return res
+
+    def _resolve_indices(self, residue_ids):
+        ref = getattr(self.contig_map, 'ref', None)
+        if not ref: raise ValueError('two_level_motif_rigid requires contig_map.ref')
+        r_set = set(residue_ids)
+        idx = [i for i, r in enumerate(ref) if r in r_set]
+        return torch.tensor(sorted(set(idx)), dtype=torch.long)
+
+    def _detect_helices(self, xyz_ca):
+        # Extremely simplified helix detection: i to i+3 Ca distance < 6.5A
+        # Identifies contiguous spans of residues meeting this criteria.
+        L = xyz_ca.shape[0]
+        is_helix = torch.zeros(L, dtype=torch.bool, device=xyz_ca.device)
+        for i in range(L - 3):
+            dist = torch.linalg.norm(xyz_ca[i] - xyz_ca[i+3])
+            if dist < 6.5:
+                is_helix[i:i+4] = True
+        
+        # Extract contiguous runs
+        helices = []
+        in_helix = False
+        start = -1
+        for i in range(L):
+            if is_helix[i] and not in_helix:
+                start = i
+                in_helix = True
+            elif not is_helix[i] and in_helix:
+                if (i - start) >= 8: # Arbitrary min helix length
+                    helices.append(list(range(start, i)))
+                in_helix = False
+        if in_helix and (L - start) >= 8:
+            helices.append(list(range(start, L)))
+        return helices
+
+    def _ensure_cache(self, xyz):
+        if self._cache_device == xyz.device: return
+        self._cache_device = xyz.device
+        
+        idx = self._resolve_indices(self._parse_residue_spec(self.motif_spec)).to(xyz.device)
+        xyz_ca = self.xyz_ref[idx, 1, :].to(xyz.device) # CA
+        
+        self.idx = idx
+        self._helices = self._detect_helices(xyz_ca)
+        
+        # Precompute intra-helix distances
+        self._ref_intra_dmats = []
+        for h in self._helices:
+            crds = xyz_ca[h]
+            dmat = torch.cdist(crds, crds)
+            self._ref_intra_dmats.append(dmat)
+            
+        # Precompute inter-helix stats (COM and vectors)
+        coms = []
+        vecs = []
+        for h in self._helices:
+            h_crds = xyz_ca[h]
+            com = h_crds.mean(dim=0)
+            coms.append(com)
+            
+            mid = len(h) // 2
+            v = h_crds[mid:].mean(dim=0) - h_crds[:mid].mean(dim=0)
+            vecs.append(v / (torch.linalg.norm(v) + self.eps))
+            
+        if len(coms) > 0:
+            coms = torch.stack(coms)
+            vecs = torch.stack(vecs)
+            self._ref_inter_com_dmat = torch.cdist(coms, coms)
+            self._ref_inter_vec_angles = torch.matmul(vecs, vecs.T)
+            
+    def compute(self, xyz_curr):
+        self._ensure_cache(xyz_curr)
+        xyz_ca = xyz_curr[self.idx, 1, :]
+        
+        loss = xyz_curr.new_tensor(0.0)
+        if len(self._helices) == 0:
+            return loss
+        
+        # 1. Local (Intra-Helix) Loss
+        for i, h in enumerate(self._helices):
+            crds = xyz_ca[h]
+            # Add eps to coordinates to avoid exactly identical coordinates producing NaN gradients in cdist
+            crds_eps = crds + torch.randn_like(crds) * 1e-6
+            dcur = torch.cdist(crds_eps[None, ...], crds_eps[None, ...], p=2)[0]
+            dref = self._ref_intra_dmats[i]
+            loss = loss + self.intra_weight * torch.mean(torch.sqrt(((dcur - dref)/self.k) ** 2 + 1) - 1)
+            
+        # 2. Global (Inter-Helix) Loss
+        if len(self._helices) > 1:
+            coms = []
+            vecs = []
+            for h in self._helices:
+                h_crds = xyz_ca[h]
+                com = h_crds.mean(dim=0)
+                coms.append(com)
+                mid = len(h) // 2
+                v = h_crds[mid:].mean(dim=0) - h_crds[:mid].mean(dim=0)
+                vecs.append(v / (torch.linalg.norm(v) + self.eps))
+                
+            coms = torch.stack(coms)
+            vecs = torch.stack(vecs)
+            
+            coms_eps = coms + torch.randn_like(coms) * 1e-6
+            curr_com_dmat = torch.cdist(coms_eps[None, ...], coms_eps[None, ...], p=2)[0]
+            curr_vec_angles = torch.matmul(vecs, vecs.T)
+            
+            com_loss = torch.mean(torch.sqrt(((curr_com_dmat - self._ref_inter_com_dmat)/self.k) ** 2 + 1) - 1)
+            vec_loss = torch.nn.functional.mse_loss(curr_vec_angles, self._ref_inter_vec_angles)
+            
+            loss = loss + self.inter_weight * (com_loss + vec_loss)
+            
+        return -self.weight * self.k**2 * loss
+
+
 class motif_rigid(Potential):
     '''
     Penalize changes in a motif's internal geometry while allowing free rigid-body motion.
@@ -834,6 +983,7 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'olig_contacts':        olig_contacts,
                            'substrate_contacts':    substrate_contacts,
                            'motif_rigid':          motif_rigid,
+                           'two_level_motif_rigid':  two_level_motif_rigid,
                            'motif_distance':       motif_distance}
 
 require_binderlen      = { 'binder_ROG',

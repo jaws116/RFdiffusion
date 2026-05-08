@@ -16,6 +16,25 @@ from rfdiffusion.inference import model_runners
 import glob
 from typing import Dict, List, Optional, Tuple
 
+
+def kabsch_rotation(P, Q):
+    """Compute the optimal rotation matrix that aligns P to Q.
+
+    Args:
+        P (torch.Tensor): (N, 3) reference points centered at origin.
+        Q (torch.Tensor): (N, 3) target points centered at origin.
+
+    Returns:
+        torch.Tensor: (3, 3) rotation matrix.
+    """
+    C = P.T @ Q
+    U, _, Vh = torch.linalg.svd(C)
+    R = Vh.T @ U.T
+    if torch.det(R) < 0:
+        Vh[-1, :] *= -1
+        R = Vh.T @ U.T
+    return R
+
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
 ###########################################################

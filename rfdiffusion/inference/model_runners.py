@@ -15,6 +15,7 @@ from rfdiffusion import util
 from hydra.core.hydra_config import HydraConfig
 import os
 import string
+from typing import Dict, List, Optional, Tuple
 
 from rfdiffusion.model_input_logger import pickle_function_call
 import sys
@@ -136,6 +137,7 @@ class Sampler:
         self.potential_conf = self._conf.potentials
         self.diffuser_conf = self._conf.diffuser
         self.preprocess_conf = self._conf.preprocess
+        self.sampler_conf = self._conf.inference_sampler
 
         if conf.inference.schedule_directory_path is not None:
             schedule_directory = conf.inference.schedule_directory_path
@@ -323,6 +325,159 @@ class Sampler:
         )
         return iu.Denoise(**denoise_kwargs)
 
+    def _parse_residue_spec(self, spec: str) -> Optional[Tuple[str, int, int]]:
+        if not spec:
+            return None
+        chain_id = spec[0]
+        res_spec = spec[1:]
+        if "-" in res_spec:
+            start, end = res_spec.split("-")
+            return chain_id, int(start), int(end)
+        return chain_id, int(res_spec), int(res_spec)
+
+    def _resolve_floating_motif_blocks(self) -> List[List[int]]:
+        if "floating_motifs" not in self.sampler_conf:
+            return []
+        specs = self.sampler_conf.floating_motifs
+        if specs is None:
+            return []
+        if isinstance(specs, str):
+            specs = [specs]
+        ref_index_map: Dict[Tuple[str, int], List[int]] = {}
+        for idx, ref in enumerate(self.contig_map.ref):
+            if ref != ("_", "_"):
+                ref_index_map.setdefault(ref, []).append(idx)
+        blocks: List[List[int]] = []
+        for spec in specs:
+            parsed = self._parse_residue_spec(spec)
+            if parsed is None:
+                continue
+            chain_id, start, end = parsed
+            indices: List[int] = []
+            for res in range(start, end + 1):
+                indices.extend(ref_index_map.get((chain_id, res), []))
+            indices = sorted(set(indices))
+            if not indices:
+                self._log.warning(
+                    f"Floating motif spec {spec} did not match any residues in the contig map."
+                )
+                continue
+            blocks.append(indices)
+
+        blocks.sort(key=lambda b: b[0])
+        merged: List[List[int]] = []
+        for block in blocks:
+            if not merged:
+                merged.append(block)
+                continue
+            if block[0] <= merged[-1][-1] + 1:
+                merged[-1] = sorted(set(merged[-1] + block))
+            else:
+                merged.append(block)
+        if len(merged) < len(blocks):
+            self._log.info(
+                "Adjacent floating motif specs were merged into a single block."
+            )
+        return merged
+
+    def _init_floating_motif_projection(self) -> None:
+        self.floating_motif_blocks = []
+        if not bool(self.sampler_conf.floating_motif_project):
+            return
+
+        blocks = self._resolve_floating_motif_blocks()
+        if not blocks:
+            self._log.info(
+                "Loaded floating motif segments for Kabsch projection: 0 block(s)"
+            )
+            return
+
+        ref_xyz = torch.as_tensor(self.target_feats["xyz_27"]).float()
+        mask_27 = torch.as_tensor(self.target_feats["mask_27"]).bool()
+        ref_map = {
+            hal_idx: ref_idx
+            for hal_idx, ref_idx in zip(self.contig_map.hal_idx0, self.contig_map.ref_idx0)
+        }
+        mask_str = self.mask_str.squeeze().cpu().numpy()
+
+        for block in blocks:
+            ref_bb_list: List[torch.Tensor] = []
+            keep_indices: List[int] = []
+            has_fixed = False
+            for idx in block:
+                if mask_str[idx]:
+                    has_fixed = True
+                ref_idx = ref_map.get(idx)
+                if ref_idx is None:
+                    continue
+                if not bool(mask_27[ref_idx, :4].all()):
+                    continue
+                ref_bb_list.append(ref_xyz[ref_idx, :4, :])
+                keep_indices.append(idx)
+            if has_fixed:
+                self._log.warning(
+                    "Floating motif block includes residues fixed by inpaint_str; they will not move."
+                )
+            if not keep_indices:
+                continue
+            if len(keep_indices) < 3:
+                self._log.warning(
+                    "Skipping floating motif block with fewer than 3 residues."
+                )
+                continue
+            ref_bb = torch.stack(ref_bb_list, dim=0)
+            ref_ca = ref_bb[:, 1, :]
+            ref_ca_mean = ref_ca.mean(dim=0)
+            ref_bb_centered = ref_bb - ref_ca_mean[None, None, :]
+            ref_ca_centered = ref_ca - ref_ca_mean[None, :]
+            self.floating_motif_blocks.append(
+                {
+                    "indices": keep_indices,
+                    "ref_bb_centered": ref_bb_centered,
+                    "ref_ca_centered": ref_ca_centered,
+                }
+            )
+
+        self._log.info(
+            f"Loaded floating motif segments for Kabsch projection: {len(self.floating_motif_blocks)} block(s)"
+        )
+
+    def _should_project_floating_motifs(self, t: int) -> bool:
+        if not bool(self.sampler_conf.floating_motif_project):
+            return False
+        if not getattr(self, "floating_motif_blocks", None):
+            return False
+        step_idx = int(self.diffuser_conf.T) - int(t) + 1
+        burn_in = int(self.sampler_conf.floating_motif_burn_in)
+        if step_idx <= burn_in:
+            return False
+        stop_after = int(self.sampler_conf.floating_motif_stop_after)
+        if stop_after > 0 and step_idx > burn_in + stop_after:
+            return False
+        every = int(self.sampler_conf.floating_motif_project_every)
+        if every <= 0:
+            return False
+        return ((step_idx - burn_in) % every) == 0
+
+    def _apply_floating_motif_projection(self, x_t_1: torch.Tensor) -> torch.Tensor:
+        for block in self.floating_motif_blocks:
+            indices = block["indices"]
+            current_ca = x_t_1[indices, 1, :]
+            if torch.isnan(current_ca).any():
+                continue
+            current_mean = current_ca.mean(dim=0)
+            current_centered = current_ca - current_mean[None, :]
+            ref_ca_centered = block["ref_ca_centered"].to(
+                device=x_t_1.device, dtype=x_t_1.dtype
+            )
+            ref_bb_centered = block["ref_bb_centered"].to(
+                device=x_t_1.device, dtype=x_t_1.dtype
+            )
+            rotation = iu.kabsch_rotation(ref_ca_centered, current_centered)
+            rotated_bb = torch.matmul(ref_bb_centered, rotation.T) + current_mean[None, None, :]
+            x_t_1[indices, :4, :] = rotated_bb
+        return x_t_1
+
     def sample_init(self, return_forward_trajectory=False):
         """
         Initial features to start the sampling process.
@@ -434,6 +589,8 @@ class Sampler:
                     for contig_ref in self.contig_map.ref[first_res:last_res]
                 ]
             first_res = last_res
+
+        self._init_floating_motif_projection()
 
         ####################################
         ### Generate initial coordinates ###
@@ -823,6 +980,8 @@ class Sampler:
                 diffusion_mask=self.mask_str.squeeze(),
                 align_motif=self.inf_conf.align_motif,
             )
+            if self._should_project_floating_motifs(t):
+                x_t_1 = self._apply_floating_motif_projection(x_t_1)
         else:
             x_t_1 = torch.clone(px0).to(x_t.device)
             seq_t_1 = torch.clone(seq_init)
@@ -926,6 +1085,8 @@ class SelfConditioning(Sampler):
                 align_motif=self.inf_conf.align_motif,
                 include_motif_sidechains=self.preprocess_conf.motif_sidechain_input,
             )
+            if self._should_project_floating_motifs(t):
+                x_t_1 = self._apply_floating_motif_projection(x_t_1)
             self._log.info(
                 f"Timestep {t}, input to next step: { seq2chars(torch.argmax(seq_t_1, dim=-1).tolist())}"
             )
